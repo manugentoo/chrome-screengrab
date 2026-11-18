@@ -3,6 +3,9 @@ const CAPTURE_INTERVAL_MS = 550;
 // Chrome's canvas limits; taller pages are split into several images.
 const MAX_CANVAS_DIM = 32767;
 const MAX_CANVAS_AREA = 268435456;
+// A4 portrait, in PDF points.
+const PDF_PAGE_W = 595.28;
+const PDF_PAGE_H = 841.89;
 // Pages Chrome never lets extensions capture or script.
 const RESTRICTED_URLS = [
   /^(chrome|edge|about|devtools|view-source|chrome-extension|chrome-search):/i,
@@ -35,7 +38,8 @@ async function run(mode, tabId) {
     if (mode === 'visible') {
       await save(await capture(tab), `${base}.png`);
     } else {
-      await captureFullPage(tab, base);
+      const makeSink = (width) => (mode === 'pdf' ? new PdfSink(base, width) : new PngSink(base));
+      await captureFullPage(tab, makeSink);
     }
     report('Saved!', 'done');
   } catch (err) {
@@ -47,7 +51,7 @@ async function run(mode, tabId) {
   }
 }
 
-async function captureFullPage(tab, base) {
+async function captureFullPage(tab, makeSink) {
   const target = { tabId: tab.id };
   const info = await exec(target, pagePrepare);
   try {
@@ -64,7 +68,7 @@ async function captureFullPage(tab, base) {
       if (i === 1) await exec(target, pageHideFixed);
       const actualY = await exec(target, pageScrollTo, [positions[i]]);
       const bitmap = await createImageBitmap(await (await fetch(await capture(tab))).blob());
-      stitcher ??= new Stitcher(bitmap.width, bitmap.width / info.viewWidth, info, base);
+      stitcher ??= new Stitcher(bitmap.width, bitmap.width / info.viewWidth, info, makeSink(bitmap.width));
       await stitcher.draw(bitmap, actualY);
       bitmap.close();
     }
@@ -76,13 +80,15 @@ async function captureFullPage(tab, base) {
 }
 
 class Stitcher {
-  constructor(width, scale, info, base) {
+  constructor(width, scale, info, sink) {
     this.width = width;
     this.scale = scale;
-    this.base = base;
+    this.sink = sink;
     this.totalHeight = Math.round(info.fullHeight * scale);
     this.frameHeight = Math.round(info.viewHeight * scale);
-    this.chunkHeight = Math.min(MAX_CANVAS_DIM, Math.floor(MAX_CANVAS_AREA / width));
+    // Chunks are a whole number of sink pages tall, so no page straddles two chunks.
+    const maxHeight = Math.min(MAX_CANVAS_DIM, Math.floor(MAX_CANVAS_AREA / width));
+    this.chunkHeight = Math.floor(maxHeight / sink.align) * sink.align;
     this.parts = Math.ceil(this.totalHeight / this.chunkHeight);
     this.open(0);
   }
@@ -108,15 +114,109 @@ class Stitcher {
     }
   }
 
-  finish() {
-    return this.flush();
+  async finish() {
+    await this.flush();
+    await this.sink.finish();
   }
 
-  async flush() {
-    const blob = await this.canvas.convertToBlob({ type: 'image/png' });
-    const name = this.parts > 1 ? `${this.base}-part${this.index + 1}.png` : `${this.base}.png`;
+  flush() {
+    return this.sink.add(this.canvas, this.index, this.parts);
+  }
+}
+
+// Saves each stitched chunk as its own PNG.
+class PngSink {
+  constructor(base) {
+    this.base = base;
+    this.align = 1;
+  }
+
+  async add(canvas, index, parts) {
+    const blob = await canvas.convertToBlob({ type: 'image/png' });
+    const name = parts > 1 ? `${this.base}-part${index + 1}.png` : `${this.base}.png`;
     await save(await blobToDataUrl(blob), name);
   }
+
+  async finish() {}
+}
+
+// Slices stitched chunks into A4 pages and saves them as one PDF.
+class PdfSink {
+  constructor(base, width) {
+    this.base = base;
+    this.width = width;
+    this.align = Math.round((width * PDF_PAGE_H) / PDF_PAGE_W);
+    this.pages = [];
+  }
+
+  async add(canvas) {
+    for (let y = 0; y < canvas.height; y += this.align) {
+      const h = Math.min(this.align, canvas.height - y);
+      const page = new OffscreenCanvas(this.width, h);
+      const ctx = page.getContext('2d');
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, this.width, h);
+      ctx.drawImage(canvas, 0, y, this.width, h, 0, 0, this.width, h);
+      const blob = await page.convertToBlob({ type: 'image/jpeg', quality: 0.92 });
+      this.pages.push({ width: this.width, height: h, bytes: new Uint8Array(await blob.arrayBuffer()) });
+    }
+  }
+
+  async finish() {
+    await save(await blobToDataUrl(buildPdf(this.pages)), `${this.base}.pdf`);
+  }
+}
+
+// Minimal PDF 1.4: one JPEG image per A4 page, anchored at the top.
+function buildPdf(pages) {
+  const enc = new TextEncoder();
+  const chunks = [];
+  const offsets = [];
+  let length = 0;
+  const push = (data) => {
+    const bytes = typeof data === 'string' ? enc.encode(data) : data;
+    chunks.push(bytes);
+    length += bytes.length;
+  };
+  const begin = (id) => {
+    offsets[id] = length;
+    push(`${id} 0 obj\n`);
+  };
+  const num = (n) => +n.toFixed(2);
+
+  push('%PDF-1.4\n');
+  begin(1);
+  push('<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+  begin(2);
+  const kids = pages.map((_, i) => `${3 + i * 3} 0 R`).join(' ');
+  push(`<< /Type /Pages /Kids [${kids}] /Count ${pages.length} >>\nendobj\n`);
+
+  pages.forEach((p, i) => {
+    const [pageId, contentId, imageId] = [3 + i * 3, 4 + i * 3, 5 + i * 3];
+    const drawH = (p.height * PDF_PAGE_W) / p.width;
+    const content = `q ${num(PDF_PAGE_W)} 0 0 ${num(drawH)} 0 ${num(PDF_PAGE_H - drawH)} cm /Im0 Do Q`;
+    begin(pageId);
+    push(
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PDF_PAGE_W} ${PDF_PAGE_H}] ` +
+        `/Resources << /XObject << /Im0 ${imageId} 0 R >> >> /Contents ${contentId} 0 R >>\nendobj\n`
+    );
+    begin(contentId);
+    push(`<< /Length ${content.length} >>\nstream\n${content}\nendstream\nendobj\n`);
+    begin(imageId);
+    push(
+      `<< /Type /XObject /Subtype /Image /Width ${p.width} /Height ${p.height} /ColorSpace /DeviceRGB ` +
+        `/BitsPerComponent 8 /Filter /DCTDecode /Length ${p.bytes.length} >>\nstream\n`
+    );
+    push(p.bytes);
+    push('\nendstream\nendobj\n');
+  });
+
+  const xref = length;
+  const count = 3 + pages.length * 3;
+  let table = `xref\n0 ${count}\n0000000000 65535 f \n`;
+  for (let id = 1; id < count; id++) table += `${String(offsets[id]).padStart(10, '0')} 00000 n \n`;
+  push(`${table}trailer\n<< /Size ${count} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+  return new Blob(chunks, { type: 'application/pdf' });
 }
 
 async function capture(tab) {
