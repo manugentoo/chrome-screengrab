@@ -3,6 +3,7 @@ const CAPTURE_INTERVAL_MS = 550;
 // Chrome's canvas limits; taller pages are split into several images.
 const MAX_CANVAS_DIM = 32767;
 const MAX_CANVAS_AREA = 268435456;
+const JPEG_QUALITY = 0.92;
 // A4 portrait, in PDF points.
 const PDF_PAGE_W = 595.28;
 const PDF_PAGE_H = 841.89;
@@ -21,12 +22,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'getStatus') {
     sendResponse(status);
   } else if (msg.type === 'capture') {
-    if (!busy) run(msg.mode, msg.tabId);
+    if (!busy) run(msg.mode, msg.format, msg.tabId);
     sendResponse(status);
   }
 });
 
-async function run(mode, tabId) {
+async function run(mode, format, tabId) {
   busy = true;
   report('Starting…');
   try {
@@ -35,10 +36,10 @@ async function run(mode, tabId) {
       throw new Error("Chrome doesn't allow capturing this page.");
     }
     const base = baseName(tab.url);
+    const makeSink = (width) => (format === 'pdf' ? new PdfSink(base, width) : new ImageSink(base, format));
     if (mode === 'visible') {
-      await save(await capture(tab), `${base}.png`);
+      await captureVisible(tab, makeSink);
     } else {
-      const makeSink = (width) => (mode === 'pdf' ? new PdfSink(base, width) : new PngSink(base));
       await captureFullPage(tab, makeSink);
     }
     report('Saved!', 'done');
@@ -49,6 +50,16 @@ async function run(mode, tabId) {
     busy = false;
     chrome.action.setBadgeText({ text: '' });
   }
+}
+
+async function captureVisible(tab, makeSink) {
+  const bitmap = await toBitmap(await capture(tab));
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  canvas.getContext('2d').drawImage(bitmap, 0, 0);
+  bitmap.close();
+  const sink = makeSink(canvas.width);
+  await sink.add(canvas, 0, 1);
+  await sink.finish();
 }
 
 async function captureFullPage(tab, makeSink) {
@@ -67,7 +78,7 @@ async function captureFullPage(tab, makeSink) {
       // Fixed headers/banners only belong in the first frame.
       if (i === 1) await exec(target, pageHideFixed);
       const actualY = await exec(target, pageScrollTo, [positions[i]]);
-      const bitmap = await createImageBitmap(await (await fetch(await capture(tab))).blob());
+      const bitmap = await toBitmap(await capture(tab));
       stitcher ??= new Stitcher(bitmap.width, bitmap.width / info.viewWidth, info, makeSink(bitmap.width));
       await stitcher.draw(bitmap, actualY);
       bitmap.close();
@@ -124,17 +135,19 @@ class Stitcher {
   }
 }
 
-// Saves each stitched chunk as its own PNG.
-class PngSink {
-  constructor(base) {
+// Saves each stitched chunk as its own PNG or JPG.
+class ImageSink {
+  constructor(base, ext) {
     this.base = base;
+    this.ext = ext;
     this.align = 1;
   }
 
   async add(canvas, index, parts) {
-    const blob = await canvas.convertToBlob({ type: 'image/png' });
-    const name = parts > 1 ? `${this.base}-part${index + 1}.png` : `${this.base}.png`;
-    await save(await blobToDataUrl(blob), name);
+    const options = this.ext === 'jpg' ? { type: 'image/jpeg', quality: JPEG_QUALITY } : { type: 'image/png' };
+    const blob = await canvas.convertToBlob(options);
+    const suffix = parts > 1 ? `-part${index + 1}` : '';
+    await save(await blobToDataUrl(blob), `${this.base}${suffix}.${this.ext}`);
   }
 
   async finish() {}
@@ -157,7 +170,7 @@ class PdfSink {
       ctx.fillStyle = '#fff';
       ctx.fillRect(0, 0, this.width, h);
       ctx.drawImage(canvas, 0, y, this.width, h, 0, 0, this.width, h);
-      const blob = await page.convertToBlob({ type: 'image/jpeg', quality: 0.92 });
+      const blob = await page.convertToBlob({ type: 'image/jpeg', quality: JPEG_QUALITY });
       this.pages.push({ width: this.width, height: h, bytes: new Uint8Array(await blob.arrayBuffer()) });
     }
   }
@@ -226,6 +239,10 @@ async function capture(tab) {
   if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   lastCaptureAt = Date.now();
   return chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+}
+
+async function toBitmap(dataUrl) {
+  return createImageBitmap(await (await fetch(dataUrl)).blob());
 }
 
 // saveAs: true opens the native "Save As" dialog on Windows, macOS, Linux and ChromeOS.

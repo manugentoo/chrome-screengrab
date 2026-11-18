@@ -9,10 +9,11 @@ Chrome extension that screenshots a whole web page, top to bottom, and opens the
 3. Click **Load unpacked** and pick this folder
 
 ## Use
-Click the ScreenGrab icon, then:
-- **Full page** – scrolls the page, captures every part and stitches it into one PNG
-- **Full page → PDF** – same full capture, saved as a multi-page A4 PDF
-- **Visible area** – captures just what's on screen
+Click the ScreenGrab icon, then pick a format (PNG, JPG or PDF) next to:
+- **Full Page** – scrolls the page, captures every part and stitches it into one image
+- **Visible Area** – captures just what's on screen
+
+PDFs are split into A4 pages.
 
 Keep the tab in front while it captures. Fixed headers/banners appear only once, at the top.
 
